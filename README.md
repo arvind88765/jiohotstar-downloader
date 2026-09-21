@@ -28,7 +28,11 @@ gui app to download jiohotstar content. works on both plain and DRM encrypted st
 
 
 
-https://github.com/user-attachments/assets/b8782fdc-63cb-48ed-9477-ddd9a3bcbde9
+
+
+https://github.com/user-attachments/assets/7338c0f7-a1fc-4f72-b829-6018ca9ee1d8
+
+
 
 
 
