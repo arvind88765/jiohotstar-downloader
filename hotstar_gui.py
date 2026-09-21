@@ -1023,41 +1023,64 @@ def extract_show_info(url):
         return show, ep
     except: return "", ""
 
-def make_filename(url, quality_height, codec="H264", audio_codes=None, audio_kbps=None):
+_LANG_FULL = {
+    "hin":"Hindi","tam":"Tamil","tel":"Telugu","eng":"English","kan":"Kannada",
+    "mal":"Malayalam","ben":"Bengali","mar":"Marathi","pun":"Punjabi","guj":"Gujarati",
+    "urd":"Urdu","arb":"Arabic","fre":"French","spa":"Spanish","ger":"German",
+    "jpn":"Japanese","kor":"Korean","chi":"Chinese","zho":"Chinese","por":"Portuguese",
+    "mul":"Multi",
+}
+
+def make_filename(url, quality_height, codec="AVC", audio_codes=None, audio_kbps=None,
+                  est_size_str=None, has_subs=False, year=None):
     """
-    Format: Title_Quality_Langs_VideoCodec_AudioBitrate
-    e.g.  : Dhurandhar_1080p_hi+te+ta_H264_135kbps.mkv
-            Mirzapur_S02E04_720p_hi_H264_128kbps.mkv
+    Release-style filename:
+    Title (Year) Language TRUE WEB-DL - 1080p - AVC - (DD+5.1 - 640Kbps) - 2.9GB - ESub.mkv
     """
     show, ep = extract_show_info(url)
-    def clean(s): return re.sub(r'[^\w]', '_', s).strip('_')
 
-    parts = []
+    # sanitize title
+    def san(s): return re.sub(r'[<>:"/\\|?*]', '', s).strip()
 
-    # 1. Title (show name)
-    if show: parts.append(clean(show[:35]))
+    title = san(show[:60]) if show else "Hotstar"
 
-    # 2. Episode slug if series (e.g. S02E04)
-    if ep:   parts.append(clean(ep[:40]))
+    # year tag
+    year_tag = f" ({year})" if year else ""
 
-    # 3. Quality
-    parts.append(f"{quality_height}p")
-
-    # 4. Audio language codes  e.g. hi+te+ta
+    # language tag — map 3-letter codes to full names
+    lang_tag = ""
     if audio_codes:
-        codes = [c.strip() for c in audio_codes if c.strip()]
-        if codes:
-            parts.append("+".join(codes))
+        codes = [c.strip().lower() for c in audio_codes if c.strip()]
+        if len(codes) == 1:
+            lang_tag = " " + _LANG_FULL.get(codes[0], codes[0].title())
+        elif codes:
+            # multi-audio: list all
+            names = [_LANG_FULL.get(c, c.title()) for c in codes]
+            lang_tag = " " + " + ".join(names)
 
-    # 5. Video codec  e.g. H264 / H265 / VP9
-    if codec:
-        parts.append(codec)
+    # audio codec/bitrate tag
+    kbps = int(audio_kbps) if audio_kbps and audio_kbps > 0 else 0
+    if kbps >= 320:
+        audio_tag = f"DD+5.1 - {kbps}Kbps"
+    elif kbps > 0:
+        audio_tag = f"AAC - {kbps}Kbps"
+    else:
+        audio_tag = "AAC"
 
-    # 6. Audio bitrate  e.g. 135kbps  (max across selected langs)
-    if audio_kbps and audio_kbps > 0:
-        parts.append(f"{int(audio_kbps)}kbps")
+    # size tag
+    size_tag = f" - {est_size_str}" if est_size_str else ""
 
-    return '_'.join(filter(None, parts)) or f"hotstar_{quality_height}p"
+    # episode slug
+    ep_tag = f" {san(ep[:50])}" if ep else ""
+
+    name = (f"{title}{year_tag}{ep_tag}{lang_tag} TRUE WEB-DL"
+            f" - {quality_height}p - {codec} - ({audio_tag}){size_tag}"
+            + (" - ESub" if has_subs else "")
+            + ".mkv")
+
+    # final sanitize
+    name = re.sub(r'[<>:"/\\|?*]', '', name)
+    return name
 
 # ─────────────────────────────────────────────────────────────
 #  DOWNLOADER  (N_m3u8DL-RE → yt-dlp → ffmpeg)
@@ -1800,21 +1823,14 @@ class App(tk.Tk):
         qc = tk.Frame(f, bg=BG2); qc.pack(fill="x", **PAD)
         qi = tk.Frame(qc, bg=BG2, padx=16, pady=12); qi.pack(fill="x")
 
-        # ── DRM status bar ────────────────────────────────────────────────────
+        # ── DRM status bar — inline only, no manual fetch button ─────────────
         self._drm_bar = tk.Frame(qi, bg=BG2); self._drm_bar.pack(fill="x", pady=(0,6))
         self._drm_icon = tk.Label(self._drm_bar, text="🔒", bg=BG2, fg=FG3,
                                    font=("Segoe UI",10))
         self._drm_icon.pack(side="left")
-        self._drm_lbl  = tk.Label(self._drm_bar, text="DRM: —", bg=BG2, fg=FG3,
+        self._drm_lbl  = tk.Label(self._drm_bar, text="", bg=BG2, fg=FG3,
                                    font=("Segoe UI",8))
-        self._drm_lbl.pack(side="left", padx=(4,12))
-        self._key_btn  = ttk.Button(self._drm_bar, text="🗝  Fetch Keys",
-                                     style="DRM.TButton", command=self._fetch_keys,
-                                     state="disabled")
-        self._key_btn.pack(side="left")
-        self._key_lbl  = tk.Label(self._drm_bar, text="", bg=BG2, fg=GRN,
-                                   font=("Segoe UI",8))
-        self._key_lbl.pack(side="left", padx=(8,0))
+        self._drm_lbl.pack(side="left", padx=(4,0))
 
         qt = tk.Frame(qi, bg=BG2); qt.pack(fill="x",pady=(0,6))
         tk.Label(qt, text="Select Qualities to Download", bg=BG2, fg=FG2,
@@ -2119,29 +2135,27 @@ class App(tk.Tk):
         for v in self._q_vars: v.set(val)
 
     def _update_drm_ui(self):
-        """Refresh the DRM status bar based on self._drm_status / self._drm_keys."""
+        """Refresh the DRM status bar — inline text only, no button."""
         s = self._drm_status
         if s == "none":
             self._drm_icon.configure(text="🔓", fg=GRN)
-            self._drm_lbl.configure(text="DRM: Plain stream — no keys needed", fg=GRN)
-            self._key_btn.configure(state="disabled")
-            self._key_lbl.configure(text="")
+            self._drm_lbl.configure(text="DRM: Plain stream — no decryption needed", fg=GRN)
+        elif s == "fetching":
+            self._drm_icon.configure(text="🔒", fg=YLW)
+            self._drm_lbl.configure(text="DRM: Widevine encrypted  •  Fetching decryption keys...", fg=YLW)
         elif s == "locked":
             self._drm_icon.configure(text="🔒", fg=YLW)
-            self._drm_lbl.configure(text="DRM: Widevine encrypted", fg=YLW)
-            self._key_btn.configure(state="normal")
-            self._key_lbl.configure(text="Keys needed ↑", fg=YLW)
+            self._drm_lbl.configure(text="DRM: Widevine encrypted  •  Auto-fetching keys...", fg=YLW)
         elif s == "unlocked":
             n = len(self._drm_keys)
             self._drm_icon.configure(text="🗝", fg=GRN)
-            self._drm_lbl.configure(text=f"DRM: Widevine — {n} key(s) fetched", fg=GRN)
-            self._key_btn.configure(state="normal")  # allow re-fetch
-            self._key_lbl.configure(text="✓ Ready to decrypt", fg=GRN)
+            self._drm_lbl.configure(text=f"DRM: Widevine encrypted  •  ✓ {n} key(s) fetched — ready to decrypt", fg=GRN)
+        elif s == "failed":
+            self._drm_icon.configure(text="🔒", fg=RED)
+            self._drm_lbl.configure(text="DRM: Widevine encrypted  •  ✗ Key fetch failed — check log", fg=RED)
         else:
             self._drm_icon.configure(text="🔒", fg=FG3)
-            self._drm_lbl.configure(text="DRM: —", fg=FG3)
-            self._key_btn.configure(state="disabled")
-            self._key_lbl.configure(text="")
+            self._drm_lbl.configure(text="", fg=FG3)
 
     def _fetch(self):
         url = self._url_e.get().strip()
@@ -2192,10 +2206,29 @@ class App(tk.Tk):
                     self._license_url = extract_license_url(_r.text)
                 except Exception:
                     self._license_url = None
-            # update DRM status
-            new_status = "none" if pssh is None else "locked"
-            self._drm_status = new_status
-            self.after(0, lambda: self._update_drm_ui())
+            # update DRM status + auto-fetch keys if CDM is available
+            if pssh is None:
+                self._drm_status = "none"
+                self.after(0, lambda: self._update_drm_ui())
+            else:
+                cdm_path = self.cfg.get("cdm_path", "").strip()
+                if cdm_path and os.path.exists(cdm_path):
+                    self._drm_status = "fetching"
+                    self.after(0, lambda: self._update_drm_ui())
+                    # auto-fetch keys in background
+                    _pssh2 = pssh; _lic2 = api_lic_url; _mpd2 = mpd or ""; _tok2 = tok
+                    def _auto_keys(_pssh=_pssh2, _lic=_lic2, _mpd=_mpd2, _t=_tok2):
+                        def _log(m): self.after(0, lambda m=m: self._log_w(m))
+                        keys2 = get_widevine_keys(_pssh, _t, _mpd,
+                                                  cdm_path=cdm_path, log_cb=_log,
+                                                  license_url=_lic)
+                        self._drm_keys   = keys2
+                        self._drm_status = "unlocked" if keys2 else "failed"
+                        self.after(0, self._update_drm_ui)
+                    threading.Thread(target=_auto_keys, daemon=True).start()
+                else:
+                    self._drm_status = "locked"
+                    self.after(0, lambda: self._update_drm_ui())
             self.after(0, lambda: self._show_quals(quals, audio_tracks, sub_tracks))
         threading.Thread(target=_w, daemon=True).start()
 
@@ -2207,8 +2240,8 @@ class App(tk.Tk):
         if not tok:
             messagebox.showerror("Not logged in","Login first."); return
 
-        self._key_btn.configure(state="disabled")
-        self._key_lbl.configure(text="Fetching keys...", fg=YLW)
+        self._drm_status = "fetching"
+        self._update_drm_ui()
         if not self._log_open: self._toggle_log()
 
         cdm_path    = self.cfg.get("cdm_path","")
@@ -2223,17 +2256,14 @@ class App(tk.Tk):
                 _log(f"[DRM] ✓ Licence URL from API (pre-auth'd): {license_url[:100]}\n")
             else:
                 _log("[DRM] ⚠ No licence URL from API — will try generic fallback endpoints\n")
-                _log("[DRM]   (check hotstar_api_debug.json for API response structure)\n")
             keys = get_widevine_keys(pssh, tok, mpd_url, cdm_path=cdm_path,
                                      log_cb=_log, license_url=license_url)
             self._drm_keys   = keys
-            self._drm_status = "unlocked" if keys else "locked"
+            self._drm_status = "unlocked" if keys else "failed"
             self.after(0, self._update_drm_ui)
             if keys:
-                self.after(0, lambda: self._key_btn.configure(state="normal"))
                 _log(f"[DRM] ✓ {len(keys)} key(s) ready for download\n")
             else:
-                self.after(0, lambda: self._key_btn.configure(state="normal"))
                 _log("[DRM] ✗ Key fetch failed — check log above\n")
 
         threading.Thread(target=_w, daemon=True).start()
@@ -2388,9 +2418,9 @@ class App(tk.Tk):
             else:
                 ans = messagebox.askyesno("DRM Warning",
                     "This stream is Widevine-encrypted and no keys have been fetched.\n\n"
-                    "Download will likely fail without keys.\n\n"
-                    "Fetch keys first (🗝 Fetch Keys button)?\n\n"
-                    "Click 'No' to attempt download anyway.")
+                    "No CDM (.wvd) file is set in Settings — can't auto-fetch keys.\n\n"
+                    "Set CDM path in Settings and retry?\n\n"
+                    "Click 'No' to attempt download anyway (may fail).")
                 if ans: return
 
         selected = [(i,q) for i,(q,v) in enumerate(
@@ -2457,9 +2487,12 @@ class App(tk.Tk):
                     max((audio_kbps_map.get(c, 0) for c in audio_code_list), default=0)
                     if audio_code_list else max(audio_kbps_map.values(), default=0)
                 )
-                fname    = make_filename(orig_url, q_height, "H264", audio_code_list,
-                                         audio_kbps=peak_kbps) if orig_url else \
-                           f"hotstar_{q_tag}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                has_subs = cfg_snap.get("grab_subs", False) or bool(cfg_snap.get("sub_lang") not in ("NONE",""))
+                fname    = make_filename(orig_url, q_height, "AVC", audio_code_list,
+                                         audio_kbps=peak_kbps, has_subs=has_subs) if orig_url else \
+                           f"hotstar_{q_tag}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mkv"
+                # strip .mkv — run_download appends it
+                if fname.endswith(".mkv"): fname = fname[:-4]
                 self.after(0, lambda t=q_tag, n=idx+1, tot=len(selected):
                     self._dl_status.configure(text=f"[{n}/{tot}] {t}  ⬇ Downloading…", fg=FG2))
 
