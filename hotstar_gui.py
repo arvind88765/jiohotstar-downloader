@@ -294,8 +294,8 @@ def _extract_from_player_config(pc):
         asset = pc.get(asset_key) or {}
         for group_key in ("primary", "fallback"):
             items = asset.get(group_key) or []
-            if isinstance(items, dict):  # sometimes it's a dict not list
-                items = list(items.values())
+            if isinstance(items, dict):  # sometimes it's a single dict not a list
+                items = [items]           # FIX: wrap in list, don't call .values()
             for ps in items:
                 if not isinstance(ps, dict): continue
                 curl = ps.get("content_url") or ps.get("playbackUrl") or ps.get("playback_url") or ""
@@ -327,6 +327,17 @@ def _extract_from_player_config(pc):
                         m3u8 = curl
                 # Collect any licence_url even from non-DRM sets (shouldn't happen but safety net)
                 if not licence_url and lic: licence_url = lic
+
+        # FIX: also check content_urls / licence_urls arrays at media_asset root level
+        # (some HLS-only content like older Tamil movies put the m3u8 URL here, not in primary/fallback)
+        if not mpd and not m3u8:
+            for u in (asset.get("content_urls") or []):
+                if isinstance(u, str):
+                    if ".mpd" in u and not mpd:   mpd  = u
+                    elif ".m3u8" in u and not m3u8: m3u8 = u
+        for u in (asset.get("licence_urls") or []):
+            if isinstance(u, str) and u.startswith("http") and not licence_url:
+                licence_url = u
 
     # Prefer DRM stream URLs (that's what we actually want to decrypt)
     final_mpd = drm_mpd or mpd
@@ -419,7 +430,7 @@ def fetch_stream(content_id, token):
                 m3u8 = next((u for u in urls if '.m3u8' in u and 'hdnea' in u),
                             next((u for u in urls if '.m3u8' in u), None))
 
-        if mpd:
+        if mpd or m3u8:   # FIX: also return success for HLS-only (m3u8) streams
             return mpd, m3u8, licence_url, 200
 
     return None, None, None, last_status
@@ -821,6 +832,51 @@ def _get_attr(text, name, default=None):
     return m.group(1) if m else default
 
 
+def parse_m3u8_qualities(m3u8_url):
+    """
+    Parse HLS master playlist for video quality tiers.
+    Returns list matching parse_qualities() output format:
+      [{"label","height","width","bw","id","mpd_video_idx","est_size","mbps"}, ...]
+    sorted highest→lowest, deduplicated by height.
+    """
+    try:
+        r = requests.get(m3u8_url, timeout=12, headers={"Referer": "https://www.hotstar.com/"})
+        txt = r.text
+        out = []
+        seen_h = set()
+        lines = txt.splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("#EXT-X-STREAM-INF"): continue
+            # parse key=value pairs from the tag
+            kv = {}
+            for m in re.finditer(r'([\w-]+)=(?:"([^"]*)"|([\w@./:-]+))', line):
+                kv[m.group(1).upper()] = m.group(2) if m.group(2) is not None else m.group(3)
+            bw_s  = kv.get("BANDWIDTH") or kv.get("AVERAGE-BANDWIDTH")
+            res   = kv.get("RESOLUTION", "")       # e.g. "1920x1080"
+            if not bw_s: continue
+            bw = int(bw_s)
+            if bw < 5000: continue                  # skip thumbnail streams
+            w = h = 0
+            if "x" in res:
+                try:
+                    w, h = (int(x) for x in res.lower().split("x"))
+                except: pass
+            if h < 144: continue
+            lbl = f"{h}p" if h else "best"
+            if lbl in seen_h: continue
+            seen_h.add(lbl)
+            out.append({
+                "label": lbl, "height": h, "width": w,
+                "bw": bw, "id": res, "mpd_video_idx": None,
+                "est_size": "?", "mbps": bw / 1e6,
+            })
+        out.sort(key=lambda x: x["height"], reverse=True)
+        return out
+    except Exception as e:
+        print(f"[parse_m3u8_qualities] error: {e}")
+        return []
+
+
 def parse_m3u8_audio_tracks(m3u8_url):
     """
     Parse HLS master playlist for audio tracks.
@@ -1170,13 +1226,20 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
             360:  "res='640x360'",
             270:  "res='480x270'",
             240:  "res='426x240'",
+            180:  "res='320x180'",
         }
-        if height in res_map:
+        q_width  = quality.get("width",  0) if quality else 0
+        q_height = quality.get("height", 0) if quality else 0
+        is_hls_quality = quality and quality.get("mpd_video_idx") is None  # from parse_m3u8_qualities
+
+        if is_hls_quality and q_width and q_height:
+            # HLS stream: N_m3u8DL-RE requires exact res= filter — height<= does NOT work on .m3u8
+            sel = f"res='{q_width}x{q_height}'"
+        elif height in res_map:
             sel = res_map[height]
         elif height:
-            # unknown height — pick closest resolution that fits (height-only filter)
-            # N_m3u8DL-RE supports height= filter in newer builds; fall back to best
-            sel = f"height<={height}:for=best" if height else None
+            # DASH fallback — height<= works fine on MPD
+            sel = f"height<={height}:for=best"
         else:
             sel = None
         cmd = [n_path, stream_url,
@@ -1265,6 +1328,7 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
             audio_fmt = f"bestaudio[language={first_lang}]/bestaudio"
         else:
             audio_fmt = "bestaudio"
+        # For HLS: yt-dlp uses height filter same way — works correctly on m3u8 too
         fmt = (f"bestvideo[height<={height}]+{audio_fmt}/best[height<={height}]"
                if height else f"bestvideo+{audio_fmt}/best")
         cmd = [
@@ -1310,6 +1374,7 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
     cmd = [ff, "-allowed_extensions","ALL",
            "-headers","Referer: https://www.hotstar.com/\r\nOrigin: https://www.hotstar.com\r\n",
            "-i", stream_url]
+    # mpd_video_idx is None for HLS streams (no AdaptationSet index) — just copy all
     if mpd_idx is not None:
         cmd += ["-map", f"0:v:{mpd_idx}", "-map", "0:a:0"]
     cmd += ["-c","copy", out_mp4, "-y",
@@ -2183,9 +2248,16 @@ class App(tk.Tk):
             if status != 200:
                 self.after(0, lambda: self._show_err(f"API error {status}")); return
             self._mpd, self._m3u8 = mpd, m3u8
-            quals, dur, audio_tracks, sub_tracks, pssh, ad_as_ids = (
-                parse_qualities(mpd) if mpd else ([], None, [], [], None, [])
-            )
+            # FIX: handle HLS-only (m3u8) streams — no MPD quality ladder available
+            if mpd:
+                quals, dur, audio_tracks, sub_tracks, pssh, ad_as_ids = parse_qualities(mpd)
+            elif m3u8:
+                # HLS-only: parse quality tiers from EXT-X-STREAM-INF lines
+                quals        = parse_m3u8_qualities(m3u8)
+                audio_tracks = parse_m3u8_audio_tracks(m3u8)
+                dur, sub_tracks, pssh, ad_as_ids = None, [], None, []
+            else:
+                quals, dur, audio_tracks, sub_tracks, pssh, ad_as_ids = [], None, [], [], None, []
             # For plain (non-DRM) streams the MPD may only list one audio track
             # or the stream may be HLS-only — parse the m3u8 master playlist too
             # and merge any additional language tracks found there.
