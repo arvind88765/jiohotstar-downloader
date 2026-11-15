@@ -1820,10 +1820,28 @@ class App(tk.Tk):
 
         # footer removed
 
+    def _make_scrollable(self, tab):
+        """Wrap a notebook tab in a vertical-scrolling canvas; returns the inner frame."""
+        cv = tk.Canvas(tab, bg=BG, highlightthickness=0)
+        sb = tk.Scrollbar(tab, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(cv, bg=BG)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+        def _wheel(e):
+            cv.yview_scroll(-1 * (e.delta // 120), "units")
+        # bind/unbind globally on hover so only the visible tab scrolls
+        inner.bind("<Enter>", lambda e: cv.bind_all("<MouseWheel>", _wheel))
+        inner.bind("<Leave>", lambda e: cv.unbind_all("<MouseWheel>"))
+        return inner
+
     # ───────────────────── LOGIN TAB ─────────────────────
 
     def _build_login(self):
-        f = self._t_login
+        f = self._make_scrollable(self._t_login)
         col = tk.Frame(f, bg=BG); col.pack(anchor="n", padx=60, pady=28, fill="x")
 
         card = tk.Frame(col, bg=BG2, padx=30, pady=26); card.pack(fill="x")
@@ -1863,7 +1881,7 @@ class App(tk.Tk):
     # ───────────────────── DOWNLOAD TAB ─────────────────────
 
     def _build_download(self):
-        f = self._t_dl
+        f = self._make_scrollable(self._t_dl)
         PAD = dict(padx=14, pady=(10,4))
 
         # URL card
@@ -1962,7 +1980,7 @@ class App(tk.Tk):
     # ───────────────────── SETTINGS TAB ─────────────────────
 
     def _build_settings(self):
-        f = self._t_cfg
+        f = self._make_scrollable(self._t_cfg)
         outer = tk.Frame(f, bg=BG); outer.pack(fill="both",expand=True)
         card = tk.Frame(outer, bg=BG2, padx=26, pady=24); card.pack(fill="x",padx=26,pady=22)
         tk.Label(card, text="Settings", bg=BG2, fg=ACC,
